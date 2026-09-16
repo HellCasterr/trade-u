@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,7 @@ from tradeu.providers.base import DataProvider
 class _DemoStream:
     _running: bool = False
     _tick: int = 0
+    _latest: dict | None = None
 
     def start(self) -> None:
         self._running = True
@@ -29,11 +30,24 @@ class _DemoStream:
         if not self._running:
             return None
         self._tick += 1
-        return {
+        self._latest = {
             "type": "demo_tick",
             "ltp": round(22450 + np.sin(self._tick / 3) * 8, 2),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        return self._latest
+
+    def latest_quote(self) -> MarketQuote | None:
+        payload = self._latest or self.latest()
+        if payload is None:
+            return None
+        return MarketQuote(
+            ltp=float(payload["ltp"]),
+            bid=float(payload["ltp"]) - 0.5,
+            ask=float(payload["ltp"]) + 0.5,
+            timestamp=datetime.now(timezone.utc),
+            raw=payload,
+        )
 
 
 class DemoProvider(DataProvider):
@@ -50,10 +64,22 @@ class DemoProvider(DataProvider):
         seed = sum(ord(char) for char in instrument_id.upper()) + int(from_date.strftime("%j"))
         rng = np.random.default_rng(seed)
         intraday = interval.lower() not in {"day", "1day", "daily", "d"}
-        rows = 420 if intraday else max(260, min(700, (to_date - from_date).days))
-        freq = "15min" if intraday else "B"
-        end = pd.Timestamp(to_date) + pd.Timedelta(hours=15, minutes=30)
-        timestamps = pd.date_range(end=end, periods=rows, freq=freq)
+        rows = 900 if intraday else max(260, min(700, (to_date - from_date).days))
+        if intraday:
+            digits = "".join(character for character in interval if character.isdigit())
+            minutes = max(1, int(digits or "15"))
+            bars_per_day = max(1, int(375 / minutes))
+            days = int(np.ceil(rows / bars_per_day)) + 2
+            sessions = []
+            for session_date in pd.bdate_range(end=to_date, periods=days):
+                start = pd.Timestamp.combine(session_date.date(), time(9, 15)).tz_localize("Asia/Kolkata")
+                finish = pd.Timestamp.combine(session_date.date(), time(15, 30)).tz_localize("Asia/Kolkata")
+                sessions.extend(
+                    pd.date_range(start=start, end=finish - timedelta(minutes=minutes), freq=f"{minutes}min")
+                )
+            timestamps = pd.DatetimeIndex(sessions[-rows:])
+        else:
+            timestamps = pd.date_range(end=pd.Timestamp(to_date), periods=rows, freq="B", tz="Asia/Kolkata")
 
         drift = 0.00022
         noise = rng.normal(drift, 0.0048 if intraday else 0.012, rows)

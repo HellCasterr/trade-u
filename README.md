@@ -6,10 +6,13 @@ Trade-U is a local, read-only Indian-market analysis workbench. Give it cash, fu
 - classify EMA trend and price location;
 - propose an entry, stop, target, projected profit %, and projected stop-loss %;
 - show reward:risk and rupee risk/reward per lot;
-- compare the current return shape with non-overlapping historical analogues;
+- compare the current return shape with time-aligned, deliberately spaced historical analogues;
 - block a trade when its data, structure, spread, volume, expiry, position risk, sample size, or confidence is inadequate;
 - read live/historical data from **Upstox** and **Dhan**, or run with CSV/demo data;
 - model option-premium sensitivity under spot, time, and IV scenarios.
+- normalize live WebSocket ticks and re-run the decision using the latest traded price;
+- reject stale quotes, delayed candles, missing bars, weak levels, and conflicting derivative OI;
+- load live option chains and Upstox option Greeks from the UI.
 
 It does **not** place orders. A `NO TRADE` result is deliberate, not an error.
 
@@ -51,6 +54,7 @@ Set `DHAN_CLIENT_ID` and `DHAN_ACCESS_TOKEN`. Enter the numeric Dhan security ID
 Trade-U uses the official DhanHQ SDK for intraday/daily candles, full quote, option chain hooks, and MarketFeed V2. Dhan intraday history has broker-defined date-window limits; use a smaller window if the API rejects a request.
 
 See [Broker setup and data contracts](docs/BROKERS.md) for exact fields and troubleshooting.
+See [Product roadmap](docs/ROADMAP.md) for the remaining work between this research tool and unattended live deployment.
 
 ## How a decision is produced
 
@@ -66,14 +70,17 @@ flowchart TD
     G -->|No| I[NO TRADE with reasons]
 ```
 
-The historical analogue estimator normalizes the last return sequence, finds the closest older sequences, then checks whether the equivalent target or stop was touched first over a fixed forward horizon. Same-bar ambiguity is counted as a stop. The app displays the raw sample size and a Wilson confidence interval; it does not turn a small backtest into certainty.
+The historical analogue estimator normalizes the last return sequence, finds the closest older sequences at a comparable intraday time, spaces selected observations by at least one pattern/forward window, then checks whether the equivalent target or stop was touched first. Same-bar ambiguity is counted as a stop. The app displays the raw sample size and a Wilson confidence interval; it does not turn a small backtest into certainty.
 
 Every gate must pass before a directional verdict appears:
 
 | Gate | Default policy |
 |---|---|
 | Clean history | At least 150 candles and 90% valid rows |
+| Candle continuity | No more than 5% inferred missing intraday bars |
+| Timeliness | Latest candle and required live quote must be fresh during market hours |
 | Levels | Both nearby support and resistance exist |
+| Level strength | Both levels have at least two clustered touches |
 | Location | Price is within 1.2 ATR of the trend-aligned level |
 | Geometry | Stop and target are on the correct sides of entry |
 | Reward:risk | At least 1.30R |
@@ -83,6 +90,7 @@ Every gate must pass before a directional verdict appears:
 | Position risk | One lot fits the configured rupee risk budget |
 | Analogue sample | At least 20 historical matches |
 | Confidence | 95% Wilson lower bound beats break-even by 2 percentage points |
+| Derivative OI | Optional strict confirmation using 20-bar price/OI buildup classification |
 
 The sidebar exposes the thresholds that are reasonable to tune. See [Architecture](docs/ARCHITECTURE.md) for implementation details.
 
@@ -121,6 +129,7 @@ python -m ruff check .
 ```
 
 The tests do not require broker credentials or make live network calls.
+GitHub Actions runs lint and tests on Windows and Ubuntu with Python 3.11 and 3.12.
 
 ## Important limitations
 
@@ -133,4 +142,3 @@ The tests do not require broker credentials or make live network calls.
 - Historical similarity does not imply causal or persistent edge.
 
 Use this software for research and education. You remain responsible for every trading decision.
-

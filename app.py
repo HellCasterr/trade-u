@@ -58,6 +58,33 @@ def _format(value: float | None, suffix: str = "") -> str:
     return "—" if value is None else f"{value:,.2f}{suffix}"
 
 
+def _option_chain_frame(payload: dict) -> pd.DataFrame:
+    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, list):
+        return pd.json_normalize(data)
+    if isinstance(data, dict):
+        option_rows = data.get("oc") or data.get("option_chain")
+        if isinstance(option_rows, dict):
+            rows = []
+            for strike, value in option_rows.items():
+                row = {"strike": strike}
+                if isinstance(value, dict):
+                    row.update(pd.json_normalize(value, sep=".").to_dict(orient="records")[0])
+                rows.append(row)
+            return pd.DataFrame(rows)
+        return pd.json_normalize(data, sep=".")
+    return pd.DataFrame()
+
+
+def _provider_for(source_name: str):
+    credentials = st.session_state.get("provider_credentials", {})
+    if source_name == "Upstox":
+        return UpstoxProvider(credentials.get("access_token", ""))
+    if source_name == "Dhan":
+        return DhanProvider(credentials.get("client_id", ""), credentials.get("access_token", ""))
+    return DemoProvider()
+
+
 with st.sidebar:
     st.header("Market input")
     source = st.selectbox("Data source", ["Demo", "CSV upload", "Upstox", "Dhan"])
@@ -65,7 +92,7 @@ with st.sidebar:
     symbol = st.text_input("Display symbol", "NIFTY 50")
     interval = st.selectbox("Candle interval", ["15minute", "5minute", "1minute", "60minute", "day"])
     today = date.today()
-    default_days = 20 if interval != "day" else 550
+    default_days = 60 if interval != "day" else 550
     from_date = st.date_input("From", today - timedelta(days=default_days))
     to_date = st.date_input("To", today)
     lot_size = st.number_input("Lot size", min_value=1, value=1, step=1)
@@ -121,6 +148,10 @@ with st.sidebar:
         minimum_analogues = st.slider("Minimum analogue sample", 10, 50, 20)
         forward_horizon = st.slider("Forward horizon (bars)", 5, 50, 15)
         entry_zone_atr = st.slider("Maximum entry distance (ATR)", 0.4, 2.5, 1.2, 0.1)
+        minimum_zone_strength = st.slider("Minimum touches per level", 1, 5, 2)
+        max_quote_age = st.slider("Maximum live quote age (seconds)", 15, 300, 120, 15)
+        max_missing_bars = st.slider("Maximum missing intraday bars (%)", 0.0, 25.0, 5.0, 1.0)
+        require_derivative_oi = st.checkbox("Require OI confirmation for F&O", False)
     analyze_clicked = st.button("Analyze setup", type="primary", width="stretch")
 
 
@@ -133,6 +164,11 @@ config = AnalysisConfig(
     minimum_analogues=int(minimum_analogues),
     forward_horizon=int(forward_horizon),
     entry_zone_atr=float(entry_zone_atr),
+    minimum_zone_strength=int(minimum_zone_strength),
+    maximum_quote_age_seconds=int(max_quote_age),
+    maximum_missing_bar_ratio=float(max_missing_bars) / 100,
+    require_live_quote=source in {"Upstox", "Dhan"} and use_live_quote,
+    require_derivative_oi=bool(require_derivative_oi),
 )
 instrument = InstrumentSpec(
     symbol=symbol,
@@ -148,6 +184,9 @@ instrument = InstrumentSpec(
 if analyze_clicked:
     quote_warning = None
     try:
+        previous_stream = st.session_state.pop("live_stream", None)
+        if previous_stream:
+            previous_stream.stop()
         if source == "Demo":
             provider = DemoProvider()
             candles = provider.historical(instrument_id, from_date, to_date, interval)
@@ -175,7 +214,16 @@ if analyze_clicked:
                 quote = None
                 quote_warning = str(exc)
         analysis, enriched = analyze_market(candles, instrument, quote, config)
-        st.session_state["result"] = (analysis, enriched, quote, source, instrument_id, provider_args)
+        st.session_state["result"] = {
+            "analysis": analysis,
+            "data": enriched,
+            "quote": quote,
+            "source": source,
+            "instrument_id": instrument_id,
+            "provider_args": provider_args,
+            "instrument": instrument,
+            "config": config,
+        }
         st.session_state["provider_credentials"] = {"access_token": access_token, "client_id": client_id}
         st.session_state["quote_warning"] = quote_warning
     except (ProviderError, ValueError, KeyError, TypeError) as exc:
@@ -196,7 +244,15 @@ if "result" not in st.session_state:
     st.stop()
 
 
-analysis, data, live_quote, result_source, result_instrument_id, result_provider_args = st.session_state["result"]
+result = st.session_state["result"]
+analysis = result["analysis"]
+data = result["data"]
+live_quote = result["quote"]
+result_source = result["source"]
+result_instrument_id = result["instrument_id"]
+result_provider_args = result["provider_args"]
+result_instrument = result["instrument"]
+result_config = result["config"]
 verdict_class = "go" if analysis.verdict != "NO TRADE" else "wait"
 candidate = analysis.metadata.get("candidate_direction")
 candidate_note = f" · candidate {candidate}" if analysis.verdict == "NO TRADE" and candidate != "NO TRADE" else ""
@@ -215,7 +271,7 @@ top[3].metric("Net target", _format(analysis.net_target_pct, "%"))
 top[4].metric("Net stop loss", _format(analysis.net_stop_loss_pct, "%"))
 top[5].metric("Reward : risk", _format(analysis.reward_risk, "R"))
 
-st.plotly_chart(market_chart(data, analysis, instrument.symbol), width="stretch")
+st.plotly_chart(market_chart(data, analysis, result_instrument.symbol), width="stretch")
 
 summary_tab, checks_tab, live_tab, option_tab, data_tab = st.tabs(
     ["Decision summary", "No-trade checks", "Live feed", "Option lens", "Data audit"]
@@ -250,6 +306,14 @@ with summary_tab:
             st.write(f"**Risk-budget position cap:** {analysis.position_lots} lot(s)")
         patterns = analysis.metadata.get("candle_patterns") or []
         st.write("**Latest candle labels:** " + (", ".join(patterns) if patterns else "No named pattern detected"))
+        if result_instrument.kind != "CASH":
+            oi_context = analysis.metadata.get("oi_context") or {}
+            st.write(f"**OI interpretation:** {oi_context.get('classification', 'Unavailable')}")
+            if oi_context.get("available"):
+                st.caption(
+                    f"20-bar price change {oi_context.get('price_change_pct_20', 0):.2f}% · "
+                    f"OI change {oi_context.get('oi_change_pct_20', 0):.2f}%"
+                )
 
 with checks_tab:
     gate_frame = pd.DataFrame(
@@ -268,24 +332,18 @@ with live_tab:
     if result_source not in {"Upstox", "Dhan", "Demo"}:
         st.info("WebSocket streaming is available for Upstox and Dhan. CSV mode is intentionally static.")
     else:
-        st.write(
-            "Start a read-only stream for the analyzed instrument. The latest broker payload is shown as received."
-        )
+        st.write("Start a read-only stream, normalize the latest tick, and apply it to the actual decision engine.")
         start_col, stop_col, refresh_col = st.columns(3)
         if start_col.button("Start live stream", width="stretch"):
             try:
-                credentials = st.session_state.get("provider_credentials", {})
+                active_provider = _provider_for(result_source)
                 if result_source == "Upstox":
-                    active_provider = UpstoxProvider(credentials.get("access_token", ""))
                     handle = active_provider.stream(result_instrument_id, mode="full")
                 elif result_source == "Dhan":
-                    active_provider = DhanProvider(
-                        credentials.get("client_id", ""), credentials.get("access_token", "")
-                    )
                     handle = active_provider.stream(
                         result_instrument_id,
                         exchange_segment=result_provider_args.get("exchange_segment", "NSE_EQ"),
-                        mode="quote",
+                        mode="full",
                     )
                 else:
                     handle = DemoProvider().stream(result_instrument_id)
@@ -298,17 +356,47 @@ with live_tab:
             if handle:
                 handle.stop()
                 st.session_state.pop("live_stream", None)
-        refresh_col.button("Refresh latest payload", width="stretch")
+        if refresh_col.button("Fetch REST quote", width="stretch"):
+            try:
+                active_provider = _provider_for(result_source)
+                refreshed_quote = active_provider.quote(result_instrument_id, **result_provider_args)
+                refreshed_analysis, refreshed_data = analyze_market(
+                    data, result_instrument, refreshed_quote, result_config
+                )
+                result.update(analysis=refreshed_analysis, data=refreshed_data, quote=refreshed_quote)
+                st.session_state["result"] = result
+                st.rerun()
+            except (ProviderError, ValueError) as exc:
+                st.error(str(exc))
         handle = st.session_state.get("live_stream")
         if handle:
             st.write(f"Status: **{handle.status}**")
             latest = handle.latest()
-            st.code(json.dumps(latest, indent=2, default=str) if latest else "Waiting for first tick…", language="json")
+            normalized_quote = handle.latest_quote()
+            if normalized_quote:
+                tick_cols = st.columns(4)
+                tick_cols[0].metric("Stream LTP", _format(normalized_quote.ltp))
+                tick_cols[1].metric("Bid", _format(normalized_quote.bid))
+                tick_cols[2].metric("Ask", _format(normalized_quote.ask))
+                tick_cols[3].metric("Spread", _format(normalized_quote.spread_pct, "%"))
+                if st.button("Apply latest tick and re-analyze", type="primary"):
+                    refreshed_analysis, refreshed_data = analyze_market(
+                        data, result_instrument, normalized_quote, result_config
+                    )
+                    result.update(analysis=refreshed_analysis, data=refreshed_data, quote=normalized_quote)
+                    st.session_state["result"] = result
+                    st.rerun()
+            else:
+                st.caption("Waiting for a tick containing a last-traded price…")
+            with st.expander("Raw broker payload"):
+                st.code(
+                    json.dumps(latest, indent=2, default=str) if latest else "Waiting for first tick…", language="json"
+                )
         else:
             st.caption("Stream stopped. Broker market-data subscriptions and exchange hours still apply.")
 
 with option_tab:
-    if instrument.kind != "OPTION":
+    if result_instrument.kind != "OPTION":
         st.info("Choose OPTION as the instrument type to use the volatility and time-decay scenario lens.")
     else:
         st.warning(
@@ -320,19 +408,57 @@ with option_tab:
         stop_spot = col3.number_input("Underlying stop", min_value=0.01, value=22350.0)
         iv = st.slider("Implied volatility (%)", 5.0, 100.0, 18.0, 0.5)
         holding_days = st.slider("Expected holding period (days)", 0.1, 10.0, 1.0, 0.1)
-        if instrument.expiry and instrument.strike and instrument.option_type:
+        if result_instrument.expiry and result_instrument.strike and result_instrument.option_type:
             scenarios = option_scenarios(
                 analysis.entry,
                 underlying_spot,
-                instrument.strike,
-                instrument.expiry,
-                instrument.option_type,
+                result_instrument.strike,
+                result_instrument.expiry,
+                result_instrument.option_type,
                 target_spot,
                 stop_spot,
                 iv,
                 holding_days,
             )
             st.dataframe(scenarios.style.format(precision=2), width="stretch", hide_index=True)
+        st.subheader("Broker option analytics")
+        if result_source == "Upstox":
+            underlying_key = st.text_input("Underlying Upstox key", "NSE_INDEX|Nifty 50")
+            if st.button("Load Upstox chain and Greeks"):
+                try:
+                    active_provider = _provider_for(result_source)
+                    chain = active_provider.option_chain(underlying_key, result_instrument.expiry)
+                    greeks = active_provider.option_greeks([result_instrument_id])
+                    st.session_state["option_chain"] = chain
+                    st.session_state["option_greeks"] = greeks
+                except ProviderError as exc:
+                    st.error(str(exc))
+        elif result_source == "Dhan":
+            chain_col1, chain_col2 = st.columns(2)
+            underlying_id = chain_col1.number_input("Underlying Dhan security ID", min_value=1, value=13)
+            underlying_segment = chain_col2.selectbox("Underlying segment", ["IDX_I", "NSE_EQ"])
+            if st.button("Load Dhan option chain"):
+                try:
+                    active_provider = _provider_for(result_source)
+                    st.session_state["option_chain"] = active_provider.option_chain(
+                        int(underlying_id), underlying_segment, result_instrument.expiry.isoformat()
+                    )
+                    st.session_state.pop("option_greeks", None)
+                except ProviderError as exc:
+                    st.error(str(exc))
+            st.caption("Dhan documents one unique option-chain request every three seconds.")
+        else:
+            st.caption("Connect Upstox or Dhan to load a live option chain and broker Greeks.")
+        chain_payload = st.session_state.get("option_chain")
+        if chain_payload:
+            chain_frame = _option_chain_frame(chain_payload)
+            if not chain_frame.empty:
+                st.dataframe(chain_frame, width="stretch", hide_index=True)
+        greeks_payload = st.session_state.get("option_greeks")
+        if greeks_payload:
+            greek_frame = _option_chain_frame(greeks_payload)
+            if not greek_frame.empty:
+                st.dataframe(greek_frame, width="stretch", hide_index=True)
 
 with data_tab:
     st.write(f"**Rows used:** {len(data):,}")
@@ -346,7 +472,7 @@ with data_tab:
     st.download_button(
         "Download enriched candles",
         data.to_csv(index=False).encode("utf-8"),
-        file_name=f"{instrument.symbol.replace(' ', '_')}_tradeu_analysis.csv",
+        file_name=f"{result_instrument.symbol.replace(' ', '_')}_tradeu_analysis.csv",
         mime="text/csv",
     )
 

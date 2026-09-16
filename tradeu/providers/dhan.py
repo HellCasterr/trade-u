@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
 from collections import deque
 from datetime import date, datetime, timezone
 from typing import Any
 
 import pandas as pd
 
+from tradeu.live import payload_to_quote
 from tradeu.models import MarketQuote
 from tradeu.providers.base import DataProvider, ProviderError
 
@@ -87,11 +89,15 @@ class DhanLiveStream:
     def latest(self) -> dict | None:
         return self._messages[-1] if self._messages else None
 
+    def latest_quote(self) -> MarketQuote | None:
+        payload = self.latest()
+        return payload_to_quote(payload) if payload else None
+
 
 class DhanProvider(DataProvider):
     """Read-only adapter around the official DhanHQ Python SDK."""
 
-    def __init__(self, client_id: str, access_token: str):
+    def __init__(self, client_id: str, access_token: str, retry_delays: tuple[float, ...] = (0.4, 1.0)):
         if not client_id.strip() or not access_token.strip():
             raise ProviderError("Dhan client ID and access token are required.")
         self.client_id = client_id.strip()
@@ -102,6 +108,7 @@ class DhanProvider(DataProvider):
             raise ProviderError("Install dhanhq to use the Dhan provider.") from exc
         self._context = DhanContext(self.client_id, self.access_token)
         self._client = dhanhq(self._context)
+        self.retry_delays = retry_delays
 
     @staticmethod
     def _validate(response: dict, operation: str) -> dict:
@@ -111,6 +118,23 @@ class DhanProvider(DataProvider):
             message = response.get("remarks") or response.get("errorMessage") or response
             raise ProviderError(f"Dhan {operation} failed: {message}")
         return response
+
+    def _call(self, operation: str, function, *args, **kwargs) -> dict:
+        last_error: Exception | None = None
+        for attempt in range(len(self.retry_delays) + 1):
+            try:
+                response = function(*args, **kwargs)
+                retryable = isinstance(response, dict) and str(response.get("errorCode", "")) in {"800", "805"}
+                if not retryable or attempt == len(self.retry_delays):
+                    return self._validate(response, operation)
+            except ProviderError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt == len(self.retry_delays):
+                    raise ProviderError(f"Dhan {operation} failed after retries: {exc}") from exc
+            time.sleep(self.retry_delays[attempt])
+        raise ProviderError(f"Dhan {operation} failed after retries: {last_error}")
 
     def historical(
         self,
@@ -124,7 +148,9 @@ class DhanProvider(DataProvider):
         instrument_type = kwargs.get("instrument_type", "EQUITY")
         value = interval.strip().lower()
         if value in {"day", "1day", "daily", "d"}:
-            response = self._client.historical_daily_data(
+            response = self._call(
+                "historical data",
+                self._client.historical_daily_data,
                 instrument_id,
                 exchange_segment,
                 instrument_type,
@@ -138,7 +164,9 @@ class DhanProvider(DataProvider):
             minutes = int(digits or "1")
             if minutes not in {1, 5, 15, 25, 60}:
                 raise ProviderError("Dhan interval must be 1, 5, 15, 25, or 60 minutes.")
-            response = self._client.intraday_minute_data(
+            response = self._call(
+                "historical data",
+                self._client.intraday_minute_data,
                 instrument_id,
                 exchange_segment,
                 instrument_type,
@@ -147,7 +175,7 @@ class DhanProvider(DataProvider):
                 interval=minutes,
                 oi=bool(kwargs.get("oi", instrument_type not in {"EQUITY", "INDEX"})),
             )
-        payload = self._validate(response, "historical data")
+        payload = response
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         frame = pd.DataFrame(
             {
@@ -175,8 +203,7 @@ class DhanProvider(DataProvider):
 
     def quote(self, instrument_id: str, **kwargs) -> MarketQuote:
         exchange_segment = kwargs.get("exchange_segment", "NSE_EQ")
-        response = self._client.quote_data({exchange_segment: [int(instrument_id)]})
-        payload = self._validate(response, "market quote")
+        payload = self._call("market quote", self._client.quote_data, {exchange_segment: [int(instrument_id)]})
         data = payload.get("data") or {}
         segment_data = data.get(exchange_segment, {})
         row = segment_data.get(str(instrument_id)) or segment_data.get(int(instrument_id)) or {}
@@ -201,12 +228,10 @@ class DhanProvider(DataProvider):
         )
 
     def option_chain(self, underlying_security_id: int, segment: str, expiry: str) -> dict:
-        response = self._client.option_chain(underlying_security_id, segment, expiry)
-        return self._validate(response, "option chain")
+        return self._call("option chain", self._client.option_chain, underlying_security_id, segment, expiry)
 
     def expiry_list(self, underlying_security_id: int, segment: str) -> dict:
-        response = self._client.expiry_list(underlying_security_id, segment)
-        return self._validate(response, "expiry list")
+        return self._call("expiry list", self._client.expiry_list, underlying_security_id, segment)
 
     def stream(self, instrument_id: str, **kwargs) -> DhanLiveStream:
         return DhanLiveStream(

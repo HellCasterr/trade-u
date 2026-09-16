@@ -57,6 +57,13 @@ class AnalysisConfig:
     estimated_cost_pct: float = 0.08
     confidence_z: float = 1.96
     probability_edge_pct: float = 2.0
+    require_live_quote: bool = False
+    maximum_quote_age_seconds: int = 120
+    maximum_missing_bar_ratio: float = 0.05
+    maximum_candle_delay_bars: float = 3.0
+    minimum_zone_strength: int = 2
+    require_derivative_oi: bool = False
+    align_intraday_analogues: bool = True
 
 
 @dataclass(slots=True)

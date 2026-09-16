@@ -60,7 +60,12 @@ Dhan's documented live-feed limits include multiple connection and per-connectio
 
 ## Live stream lifecycle
 
-The UI's **Start live stream** button constructs a broker SDK stream and starts its background thread. **Refresh latest payload** reruns the Streamlit page and reads the most recent buffered tick. **Stop live stream** closes the socket. The initial analysis is not recomputed on each tick; press **Analyze setup** when you want a new controlled decision snapshot.
+The UI's **Start live stream** button constructs a broker SDK stream and starts its background thread. The latest packet is normalized into LTP, bid, ask, volume, OI, and timestamp where those fields are present. **Apply latest tick and re-analyze** sends that normalized quote through the complete safety/decision pipeline. **Fetch REST quote** is a fallback when WebSocket streaming is unavailable. **Stop live stream** closes the socket.
 
-This separation prevents an uncontrolled UI rerun loop and preserves the exact inputs behind each displayed recommendation.
+Trade-U deliberately requires an explicit apply/refresh action instead of recomputing on every tick. This avoids an uncontrolled UI rerun loop and preserves a comprehensible decision snapshot.
 
+REST calls use bounded retry/backoff for throttling and temporary server errors. Authentication and malformed-instrument failures remain visible instead of retrying forever.
+
+## Option data
+
+For Upstox, the option lens can request the underlying put/call chain plus the selected contract's live IV, delta, gamma, theta, and vega. For Dhan, it can request the underlying option chain; Dhan's documented one-unique-request-per-three-seconds limit still applies.

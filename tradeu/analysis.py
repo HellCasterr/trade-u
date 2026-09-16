@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict
+from datetime import datetime, time, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,6 +19,70 @@ from tradeu.models import (
 )
 
 REQUIRED_COLUMNS = {"timestamp", "open", "high", "low", "close"}
+IST = ZoneInfo("Asia/Kolkata")
+NSE_OPEN = time(9, 15)
+NSE_CLOSE = time(15, 30)
+
+
+def market_session_status(now: datetime | None = None) -> tuple[bool, datetime]:
+    """Return whether the regular NSE cash/F&O session is open.
+
+    This intentionally knows weekdays and session hours, not the exchange holiday
+    calendar. A broker market-status endpoint should remain the final authority.
+    """
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local = current.astimezone(IST)
+    is_open = local.weekday() < 5 and NSE_OPEN <= local.time().replace(tzinfo=None) <= NSE_CLOSE
+    return is_open, local
+
+
+def candle_continuity(data: pd.DataFrame) -> dict[str, float | bool | None]:
+    """Estimate missing intraday bars without treating the overnight gap as missing."""
+    local = data["timestamp"].dt.tz_convert(IST)
+    diffs = local.diff().dt.total_seconds() / 60
+    same_day = local.dt.date.eq(local.shift(1).dt.date)
+    intraday_diffs = diffs[same_day & diffs.gt(0) & diffs.le(180)]
+    if intraday_diffs.empty:
+        return {"is_intraday": False, "bar_minutes": None, "missing_ratio": 0.0}
+    bar_minutes = float(intraday_diffs.median())
+    if bar_minutes <= 0:
+        return {"is_intraday": True, "bar_minutes": None, "missing_ratio": 1.0}
+    expected = np.maximum(np.rint(intraday_diffs.to_numpy() / bar_minutes).astype(int), 1)
+    missing = int(np.maximum(expected - 1, 0).sum())
+    observed = int(len(intraday_diffs))
+    return {
+        "is_intraday": True,
+        "bar_minutes": bar_minutes,
+        "missing_ratio": missing / max(observed + missing, 1),
+    }
+
+
+def derivative_oi_context(data: pd.DataFrame, instrument: InstrumentSpec) -> dict[str, float | str | bool | None]:
+    if instrument.kind == "CASH":
+        return {"available": False, "classification": "Not applicable"}
+    if "oi" not in data or data["oi"].notna().sum() < 21:
+        return {"available": False, "classification": "OI unavailable"}
+    sample = data.dropna(subset=["oi", "close"]).tail(21)
+    if len(sample) < 21 or float(sample["oi"].iloc[0]) <= 0 or float(sample["close"].iloc[0]) <= 0:
+        return {"available": False, "classification": "OI unavailable"}
+    oi_change = (float(sample["oi"].iloc[-1]) / float(sample["oi"].iloc[0]) - 1) * 100
+    price_change = (float(sample["close"].iloc[-1]) / float(sample["close"].iloc[0]) - 1) * 100
+    if price_change >= 0 and oi_change >= 0:
+        classification = "Long buildup"
+    elif price_change < 0 and oi_change >= 0:
+        classification = "Short buildup"
+    elif price_change >= 0 and oi_change < 0:
+        classification = "Short covering"
+    else:
+        classification = "Long unwinding"
+    return {
+        "available": True,
+        "classification": classification,
+        "oi_change_pct_20": oi_change,
+        "price_change_pct_20": price_change,
+    }
 
 
 def prepare_candles(candles: pd.DataFrame) -> pd.DataFrame:
@@ -119,13 +185,28 @@ def historical_analogues(
     current = log_returns[-window:]
     current = (current - current.mean()) / (current.std() + 1e-9)
     distances: list[tuple[float, int]] = []
+    continuity = candle_continuity(data)
+    timestamps = data["timestamp"].dt.tz_convert(IST)
+    current_minute = int(timestamps.iloc[-1].hour * 60 + timestamps.iloc[-1].minute)
+    bar_minutes = float(continuity.get("bar_minutes") or 0)
     latest_allowed = len(closes) - horizon - window - 2
     for end in range(window, latest_allowed + 1):
+        if config.align_intraday_analogues and continuity["is_intraday"] and bar_minutes:
+            candidate_minute = int(timestamps.iloc[end].hour * 60 + timestamps.iloc[end].minute)
+            if abs(candidate_minute - current_minute) > bar_minutes:
+                continue
         sample = log_returns[end - window : end]
         standardized = (sample - sample.mean()) / (sample.std() + 1e-9)
         distance = float(np.sqrt(np.mean((standardized - current) ** 2)))
         distances.append((distance, end))
-    selected = sorted(distances)[: config.analogue_count]
+    selected: list[tuple[float, int]] = []
+    minimum_separation = max(window, horizon)
+    for candidate in sorted(distances):
+        _, end = candidate
+        if all(abs(end - chosen_end) >= minimum_separation for _, chosen_end in selected):
+            selected.append(candidate)
+        if len(selected) >= config.analogue_count:
+            break
     target_first = stop_first = timeout = 0
     returns: list[float] = []
 
@@ -275,7 +356,24 @@ def analyze_market(
             config,
         )
 
-    spread_pass = quote is None or quote.spread_pct is None or quote.spread_pct <= config.maximum_spread_pct
+    session_open, session_time = market_session_status()
+    live_quote_pass = quote is not None or not config.require_live_quote
+    spread_pass = (
+        not config.require_live_quote
+        if quote is None or quote.spread_pct is None
+        else quote.spread_pct <= config.maximum_spread_pct
+    )
+    quote_age_seconds = None
+    if quote is not None and quote.timestamp is not None:
+        stamp = quote.timestamp
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        quote_age_seconds = max(0.0, (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds())
+    quote_fresh_pass = (
+        not session_open
+        or not config.require_live_quote
+        or (quote_age_seconds is not None and quote_age_seconds <= config.maximum_quote_age_seconds)
+    )
     rr_pass = reward_risk is not None and reward_risk >= config.minimum_reward_risk
     sample_pass = analogues.sample_size >= config.minimum_analogues
     break_even = (1 / (1 + reward_risk)) if reward_risk else 1.0
@@ -293,10 +391,40 @@ def analyze_market(
     expiry_pass = instrument.expiry is None or (instrument.expiry - pd.Timestamp.now().date()).days > 1
     data_pass = len(clean) >= 150 and len(clean) / max(raw_rows, 1) >= 0.9
     levels_pass = support is not None and resistance is not None
+    level_strength_pass = bool(
+        support is not None
+        and resistance is not None
+        and support.strength >= config.minimum_zone_strength
+        and resistance.strength >= config.minimum_zone_strength
+    )
+    continuity = candle_continuity(data)
+    continuity_pass = float(continuity["missing_ratio"] or 0.0) <= config.maximum_missing_bar_ratio
+    candle_age_minutes = max(
+        0.0,
+        (datetime.now(timezone.utc) - data["timestamp"].iloc[-1].to_pydatetime()).total_seconds() / 60,
+    )
+    candle_fresh_pass = True
+    if session_open and continuity["is_intraday"] and continuity["bar_minutes"]:
+        candle_fresh_pass = candle_age_minutes <= float(continuity["bar_minutes"]) * config.maximum_candle_delay_bars
+
+    oi_context = derivative_oi_context(data, instrument)
+    supportive_oi = True
+    if instrument.kind != "CASH":
+        if not oi_context.get("available"):
+            supportive_oi = not config.require_derivative_oi
+        elif candidate == "LONG":
+            supportive_oi = oi_context.get("classification") in {"Long buildup", "Short covering"}
+        elif candidate == "SHORT":
+            supportive_oi = oi_context.get("classification") in {"Short buildup", "Long unwinding"}
 
     gates = {
         "Enough clean history": data_pass,
+        "Candle sequence is continuous": continuity_pass,
+        "Latest candle is timely": candle_fresh_pass,
+        "Required live quote available": live_quote_pass,
+        "Live quote is fresh": quote_fresh_pass,
         "Support and resistance found": levels_pass,
+        "Support/resistance have repeated touches": level_strength_pass,
         "Trend and location align": location_ok,
         "Stop/target geometry valid": valid_geometry,
         "Reward:risk threshold": rr_pass,
@@ -307,6 +435,8 @@ def analyze_market(
         "Enough historical analogues": sample_pass,
         "Confidence clears break-even": probability_pass,
     }
+    if instrument.kind != "CASH":
+        gates["Derivative OI supports direction"] = supportive_oi
     verdict = candidate if candidate != "NO TRADE" and all(gates.values()) else "NO TRADE"
     reasons: list[str] = []
     warnings: list[str] = []
@@ -320,6 +450,8 @@ def analyze_market(
         (reasons if passed else warnings).append(("Pass: " if passed else "Block: ") + name)
     if quote is None:
         warnings.append("No live quote was supplied; spread and live-price freshness could not be verified.")
+    if instrument.kind != "CASH" and not oi_context.get("available"):
+        warnings.append("Derivative OI history is unavailable; OI confirmation could not be verified.")
     if analogues.sample_size:
         reasons.append(
             f"Historical analogue result: {analogues.target_first}/{analogues.sample_size} reached target before stop."
@@ -352,6 +484,12 @@ def analyze_market(
                 "break_even_probability": break_even,
                 "candle_patterns": _candle_labels(data),
                 "zones": clusters,
+                "session_open": session_open,
+                "session_time_ist": session_time.isoformat(),
+                "quote_age_seconds": quote_age_seconds,
+                "candle_age_minutes": candle_age_minutes,
+                "continuity": continuity,
+                "oi_context": oi_context,
                 "config": asdict(config),
             },
         ),

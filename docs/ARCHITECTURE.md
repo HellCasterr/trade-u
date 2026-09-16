@@ -15,6 +15,7 @@ Trade-U is a single-user, local Windows application. It has no order router, dat
 | `tradeu/providers/dhan.py` | DhanHQ history/quote/option-chain methods and MarketFeed V2 wrapper |
 | `tradeu/providers/demo.py` | Deterministic offline candles, quote and simulated tick |
 | `tradeu/analysis.py` | Cleaning, indicators, zones, risk geometry, analogues and gates |
+| `tradeu/live.py` | Broker-payload normalization into a shared live quote contract |
 | `tradeu/option_pricing.py` | Transparent Black–Scholes scenario calculations |
 | `tradeu/charts.py` | Plotly candlesticks, EMAs, levels, stop and target |
 
@@ -39,9 +40,10 @@ Quotes normalize LTP, best bid/ask, volume, OI and timestamp. The original broke
 4. Select a long candidate only for bullish EMA structure near support; select a short candidate only for bearish structure near resistance.
 5. Put the stop outside that level by an ATR buffer. Use the nearest opposing zone as target.
 6. Convert geometry to gross/net percentages, R multiple, rupees per lot, and a risk-budget lot cap.
-7. Match normalized return shapes against older windows. Measure target-first, stop-first, and timeout outcomes. Count same-bar ambiguity as stop-first.
+7. Match normalized return shapes against older, time-aligned, spaced windows. Measure target-first, stop-first, and timeout outcomes. Count same-bar ambiguity as stop-first.
 8. Compute a 95% Wilson interval and compare its lower bound with the setup's break-even probability.
-9. Evaluate every no-trade gate. A single block produces `NO TRADE`, while preserving the candidate and explanation for inspection.
+9. Interpret 20-bar price/OI changes for futures and options as long buildup, short buildup, short covering, or long unwinding.
+10. Evaluate freshness, candle continuity, level strength, liquidity, expiry, OI, risk and statistical gates. A single block produces `NO TRADE`, while preserving the candidate and explanation for inspection.
 
 ## Security boundaries
 
@@ -49,7 +51,7 @@ Quotes normalize LTP, best bid/ask, volume, OI and timestamp. The original broke
 - Password widgets mask tokens.
 - No broker order API is imported or called.
 - API errors are shortened and shown as actionable UI messages.
-- WebSocket handles are local daemon threads and can be explicitly stopped.
+- WebSocket handles are local daemon threads, can be explicitly stopped, and expose normalized ticks that can be applied to a fresh analysis snapshot.
 
 For a production deployment, move secrets into the Windows Credential Manager, add structured logging with redaction, isolate broker processes, persist immutable input/output audit records, and add a market-session clock plus stale-tick watchdog.
 
@@ -60,4 +62,3 @@ For a production deployment, move secrets into the Windows Credential Manager, a
 - Replace Euclidean analogue distance with dynamic time warping, but validate it against a strict out-of-sample protocol.
 - Add walk-forward backtests and purged/embargoed cross-validation before using any learned model.
 - Add current NSE contract-master synchronization and corporate-action adjustment.
-

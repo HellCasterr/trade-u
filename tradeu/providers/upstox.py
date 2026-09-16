@@ -8,7 +8,10 @@ from urllib.parse import quote as url_quote
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+from tradeu.live import payload_to_quote
 from tradeu.models import MarketQuote
 from tradeu.providers.base import DataProvider, ProviderError
 
@@ -76,6 +79,10 @@ class UpstoxLiveStream:
     def latest(self) -> dict | None:
         return self._messages[-1] if self._messages else None
 
+    def latest_quote(self) -> MarketQuote | None:
+        payload = self.latest()
+        return payload_to_quote(payload) if payload else None
+
 
 class UpstoxProvider(DataProvider):
     """Read-only Upstox V2/V3 market-data adapter."""
@@ -92,6 +99,16 @@ class UpstoxProvider(DataProvider):
                 "Authorization": f"Bearer {self.access_token}",
             }
         )
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=2,
+            backoff_factor=0.45,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     def _get(self, url: str, **kwargs) -> dict:
         try:
@@ -162,6 +179,20 @@ class UpstoxProvider(DataProvider):
 
     def stream(self, instrument_id: str, **kwargs) -> UpstoxLiveStream:
         return UpstoxLiveStream(self.access_token, instrument_id, kwargs.get("mode", "full"))
+
+    def option_chain(self, underlying_instrument_key: str, expiry: date) -> dict:
+        return self._get(
+            f"{UPSTOX_API}/v2/option/chain",
+            params={"instrument_key": underlying_instrument_key, "expiry_date": expiry.isoformat()},
+        )
+
+    def option_greeks(self, instrument_keys: list[str]) -> dict:
+        if not instrument_keys or len(instrument_keys) > 50:
+            raise ProviderError("Upstox option Greeks accepts 1 to 50 instrument keys.")
+        return self._get(
+            f"{UPSTOX_API}/v3/market-quote/option-greek",
+            params={"instrument_key": ",".join(instrument_keys)},
+        )
 
 
 def _upstox_interval(interval: str) -> tuple[str, int]:
